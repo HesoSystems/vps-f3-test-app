@@ -14,13 +14,16 @@ import (
 // version is set at build time with -ldflags "-X main.version=<commit sha>".
 var version = "dev"
 
+// release is the human-readable label of this build (bumped on each test version).
+const release = "v2"
+
 // healthy is the switch used to publish a deliberately broken version.
 var healthy = true
 
 func handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", func(w http.ResponseWriter, _ *http.Request) {
-		fmt.Fprintf(w, "vps-f3-test-app %s\n", version)
+		fmt.Fprintf(w, "vps-f3-test-app %s %s\n", release, version)
 	})
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		if !healthy {

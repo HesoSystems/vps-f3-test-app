@@ -11,7 +11,7 @@ func TestRootShowsVersion(t *testing.T) {
 	version = "abc123"
 	rec := httptest.NewRecorder()
 	handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
-	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "abc123") {
+	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "abc123") || !strings.Contains(rec.Body.String(), release) {
 		t.Fatalf("got %d %q", rec.Code, rec.Body.String())
 	}
 }
