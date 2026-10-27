@@ -1,0 +1,149 @@
+# CI + deploy of the disposable test app (VPS phase F3).
+# - push to main: test -> build on a GitHub-hosted runner -> GHCR (by digest) -> provenance
+#   -> deploy job that WAITS for manual approval in the "production" environment.
+# - workflow_dispatch: status / rollback / redeploy of an already published digest (also approval-gated).
+# Third-party actions are pinned to full commit SHAs. User inputs never reach `run:` through ${{ }}.
+name: ci-deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: "Gateway operation"
+        type: choice
+        options: [status, rollback, redeploy]
+        default: status
+      tag:
+        description: "redeploy only: commit sha of a published image (7-40 hex)"
+        required: false
+      digest:
+        description: "redeploy only: sha256:<64 hex> of that image"
+        required: false
+
+permissions: {}
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/hesosystems/vps-f3-test-app
+
+jobs:
+  test:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: false
+      - run: go vet ./... && go test -v ./...
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          build-args: VERSION=${{ github.sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          provenance: mode=max
+      - name: Verify the digest belongs to the authorized repository
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "unexpected digest format"; exit 1; }
+          by_digest=$(docker buildx imagetools inspect "$IMAGE@$DIGEST" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          by_tag=$(docker buildx imagetools inspect "$IMAGE:$SHA" --format '{{json .Manifest.Digest}}' | tr -d '"')
+          [ "$by_digest" = "$DIGEST" ] && [ "$by_tag" = "$DIGEST" ] || { echo "digest mismatch: build=$DIGEST digest-ref=$by_digest tag-ref=$by_tag"; exit 1; }
+          echo "image: $IMAGE@$DIGEST (tag $SHA)" >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  deploy:
+    if: github.event_name == 'push'
+    needs: image
+    runs-on: ubuntu-latest
+    environment: production
+    permissions: {}
+    steps:
+      - name: Deploy by digest through the VPS gateway
+        env:
+          KEY: ${{ secrets.VPS_DEPLOY_KEY }}
+          KNOWN: ${{ secrets.VPS_KNOWN_HOSTS }}
+          HOST: ${{ vars.VPS_HOST }}
+          TAG: ${{ github.sha }}
+          DIGEST: ${{ needs.image.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^[0-9a-f]{40}$ && "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "invalid tag/digest"; exit 1; }
+          umask 077; d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+          printf '%s\n' "$KEY" > "$d/key"; printf '%s\n' "$KNOWN" > "$d/known_hosts"
+          # One connection per run (the VPS rate-limits new SSH connections); no retries.
+          ssh -i "$d/key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$d/known_hosts" -o ConnectTimeout=20 \
+              "deployer@$HOST" "deploy $TAG $DIGEST"
+
+  operate:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions: {}
+    steps:
+      - name: Gateway operation (status / rollback / redeploy)
+        env:
+          KEY: ${{ secrets.VPS_DEPLOY_KEY }}
+          KNOWN: ${{ secrets.VPS_KNOWN_HOSTS }}
+          HOST: ${{ vars.VPS_HOST }}
+          OP: ${{ inputs.operation }}
+          IN_TAG: ${{ inputs.tag }}
+          IN_DIGEST: ${{ inputs.digest }}
+        run: |
+          set -euo pipefail
+          case "$OP" in
+            status|rollback) cmd="$OP" ;;
+            redeploy)
+              [[ "$IN_TAG" =~ ^[0-9a-f]{7,40}$ && "$IN_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "redeploy needs a valid tag and digest"; exit 1; }
+              cmd="deploy $IN_TAG $IN_DIGEST" ;;
+            *) echo "invalid operation"; exit 1 ;;
+          esac
+          umask 077; d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
+          printf '%s\n' "$KEY" > "$d/key"; printf '%s\n' "$KNOWN" > "$d/known_hosts"
+          ssh -i "$d/key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
+              -o UserKnownHostsFile="$d/known_hosts" -o ConnectTimeout=20 \
+              "deployer@$HOST" "$cmd"
