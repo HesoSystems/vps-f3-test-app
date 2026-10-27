@@ -15,10 +15,11 @@ import (
 var version = "dev"
 
 // release is the human-readable label of this build (bumped on each test version).
-const release = "v2"
+const release = "v3-broken"
 
 // healthy is the switch used to publish a deliberately broken version.
-var healthy = true
+// DELIBERATELY BROKEN test version: /healthz answers 500 so the VPS must roll back automatically.
+var healthy = false
 
 func handler() http.Handler {
 	mux := http.NewServeMux()

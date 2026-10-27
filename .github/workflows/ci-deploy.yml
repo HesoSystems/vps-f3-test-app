@@ -3,6 +3,7 @@
 #   -> deploy job that WAITS for manual approval in the "production" environment.
 # - workflow_dispatch: status / rollback / redeploy of an already published digest (also approval-gated).
 # Third-party actions are pinned to full commit SHAs. User inputs never reach `run:` through ${{ }}.
+# SSH: limited retries only for connection failures before any remote execution (.github/scripts/vps-gateway.sh).
 name: ci-deploy
 
 on:
@@ -100,8 +101,12 @@ jobs:
     needs: image
     runs-on: ubuntu-latest
     environment: production
-    permissions: {}
+    permissions:
+      contents: read
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Deploy by digest through the VPS gateway
         env:
           KEY: ${{ secrets.VPS_DEPLOY_KEY }}
@@ -112,19 +117,20 @@ jobs:
         run: |
           set -euo pipefail
           [[ "$TAG" =~ ^[0-9a-f]{40}$ && "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "invalid tag/digest"; exit 1; }
-          umask 077; d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
-          printf '%s\n' "$KEY" > "$d/key"; printf '%s\n' "$KNOWN" > "$d/known_hosts"
-          # One connection per run (the VPS rate-limits new SSH connections); no retries.
-          ssh -i "$d/key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
-              -o UserKnownHostsFile="$d/known_hosts" -o ConnectTimeout=20 \
-              "deployer@$HOST" "deploy $TAG $DIGEST"
+          # Up to 3 connection attempts (20 s apart, 30 s timeout) BEFORE anything runs on the VPS;
+          # the deploy command itself runs exactly once (see .github/scripts/vps-gateway.sh).
+          .github/scripts/vps-gateway.sh deploy "$TAG" "$DIGEST"
 
   operate:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     environment: production
-    permissions: {}
+    permissions:
+      contents: read
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
       - name: Gateway operation (status / rollback / redeploy)
         env:
           KEY: ${{ secrets.VPS_DEPLOY_KEY }}
@@ -136,14 +142,9 @@ jobs:
         run: |
           set -euo pipefail
           case "$OP" in
-            status|rollback) cmd="$OP" ;;
+            status|rollback) .github/scripts/vps-gateway.sh "$OP" ;;
             redeploy)
               [[ "$IN_TAG" =~ ^[0-9a-f]{7,40}$ && "$IN_DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "redeploy needs a valid tag and digest"; exit 1; }
-              cmd="deploy $IN_TAG $IN_DIGEST" ;;
+              .github/scripts/vps-gateway.sh deploy "$IN_TAG" "$IN_DIGEST" ;;
             *) echo "invalid operation"; exit 1 ;;
           esac
-          umask 077; d=$(mktemp -d); trap 'rm -rf "$d"' EXIT
-          printf '%s\n' "$KEY" > "$d/key"; printf '%s\n' "$KNOWN" > "$d/known_hosts"
-          ssh -i "$d/key" -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes \
-              -o UserKnownHostsFile="$d/known_hosts" -o ConnectTimeout=20 \
-              "deployer@$HOST" "$cmd"
